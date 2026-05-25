@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: shift-app
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+    envVars:
+      - key: SHIFT_DB_PATH
+        value: /opt/render/project/src/storage/shifts.db
+      - key: SHIFT_APP_PASSWORD
+        sync: false
+    disk:
+      name: shift-data
+      mountPath: /opt/render/project/src/storage
+      sizeGB: 1
