@@ -32,10 +32,11 @@ TIME_DISPLAY_LABELS = {
 MOTIVATION_OPTIONS = {
     "A": "A：めっちゃでたい",
     "B": "B：普通",
+    "S": "S：少なめ",
     "C": "C：足りないとこだけでたい",
 }
-MOTIVATION_PRIORITY = {"A": 0, "B": 1, "C": 2}
-MOTIVATION_RATIO_DIRECTION = {"A": 1, "B": 0, "C": -1}
+MOTIVATION_PRIORITY = {"A": 0, "B": 1, "S": 2, "C": 3}
+MOTIVATION_RATIO_DIRECTION = {"A": 1, "B": 0, "S": -0.5, "C": -1}
 BUSY_WEEKDAYS = {4, 5}
 DEFAULT_MEMBER_NAMES = ["田中", "佐藤", "鈴木", "高橋", "伊藤"]
 
@@ -45,6 +46,55 @@ DEFAULT_APP_PASSWORD = "0000"
 
 def get_app_password() -> str:
     return os.environ.get("SHIFT_APP_PASSWORD", DEFAULT_APP_PASSWORD)
+
+
+def get_database_url() -> str | None:
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        return database_url
+
+    try:
+        return st.secrets.get("DATABASE_URL")
+    except Exception:
+        return None
+
+
+class DatabaseConnection:
+    def __init__(self, raw_connection, is_postgres: bool):
+        self.raw_connection = raw_connection
+        self.is_postgres = is_postgres
+
+    def execute(self, query: str, params: tuple | list = ()):
+        if self.is_postgres:
+            query = query.replace("?", "%s")
+        return self.raw_connection.execute(query, params)
+
+    def commit(self) -> None:
+        self.raw_connection.commit()
+
+    def close(self) -> None:
+        self.raw_connection.close()
+
+
+def get_table_columns(connection: DatabaseConnection, table_name: str) -> set[str]:
+    if connection.is_postgres:
+        rows = connection.execute(
+            """
+            SELECT column_name AS name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            """,
+            (table_name,),
+        ).fetchall()
+    else:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row["name"] for row in rows}
+
+
+def is_unique_constraint_error(error: Exception) -> bool:
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    return error.__class__.__name__ in {"UniqueViolation", "IntegrityError"}
 
 
 def require_password() -> bool:
@@ -66,22 +116,30 @@ def require_password() -> bool:
     return False
 
 
-def get_connection() -> sqlite3.Connection:
+def get_connection() -> DatabaseConnection:
+    database_url = get_database_url()
+    if database_url:
+        from psycopg import connect
+        from psycopg.rows import dict_row
+
+        return DatabaseConnection(connect(database_url, row_factory=dict_row, prepare_threshold=None), is_postgres=True)
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if DB_PATH != LOCAL_DB_PATH and not DB_PATH.exists() and LOCAL_DB_PATH.exists():
         shutil.copy2(LOCAL_DB_PATH, DB_PATH)
 
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
-    return connection
+    return DatabaseConnection(connection, is_postgres=False)
 
 
 def init_db() -> None:
     with closing(get_connection()) as connection:
+        id_column = "SERIAL PRIMARY KEY" if connection.is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
         connection.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_column},
                 name TEXT NOT NULL UNIQUE,
                 is_newcomer INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
@@ -89,9 +147,9 @@ def init_db() -> None:
             """
         )
         connection.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS shifts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_column},
                 name TEXT NOT NULL,
                 shift_date TEXT NOT NULL,
                 start_time TEXT NOT NULL,
@@ -126,8 +184,7 @@ def init_db() -> None:
 
 def migrate_members_table() -> None:
     with closing(get_connection()) as connection:
-        columns = connection.execute("PRAGMA table_info(members)").fetchall()
-        column_names = {column["name"] for column in columns}
+        column_names = get_table_columns(connection, "members")
         if "is_newcomer" not in column_names:
             connection.execute("ALTER TABLE members ADD COLUMN is_newcomer INTEGER NOT NULL DEFAULT 0")
             connection.commit()
@@ -135,8 +192,7 @@ def migrate_members_table() -> None:
 
 def migrate_shifts_table() -> None:
     with closing(get_connection()) as connection:
-        columns = connection.execute("PRAGMA table_info(shifts)").fetchall()
-        column_names = {column["name"] for column in columns}
+        column_names = get_table_columns(connection, "shifts")
         if "motivation_level" not in column_names:
             connection.execute("ALTER TABLE shifts ADD COLUMN motivation_level TEXT NOT NULL DEFAULT 'B'")
             connection.commit()
@@ -144,8 +200,7 @@ def migrate_shifts_table() -> None:
 
 def migrate_staffing_requirements_table() -> None:
     with closing(get_connection()) as connection:
-        columns = connection.execute("PRAGMA table_info(staffing_requirements)").fetchall()
-        column_names = {column["name"] for column in columns}
+        column_names = get_table_columns(connection, "staffing_requirements")
         required_columns = {
             "shift_date",
             "staff_1700",
@@ -156,7 +211,7 @@ def migrate_staffing_requirements_table() -> None:
             "updated_at",
         }
 
-        if not columns:
+        if not column_names:
             return
 
         if required_columns.issubset(column_names):
@@ -203,8 +258,7 @@ def migrate_staffing_requirements_table() -> None:
         connection.execute("DROP TABLE staffing_requirements_old")
         connection.commit()
 
-        columns = connection.execute("PRAGMA table_info(staffing_requirements)").fetchall()
-        column_names = {column["name"] for column in columns}
+        column_names = get_table_columns(connection, "staffing_requirements")
         if "note" not in column_names:
             connection.execute("ALTER TABLE staffing_requirements ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             connection.commit()
@@ -244,8 +298,10 @@ def add_member(name: str, is_newcomer: bool = False) -> tuple[bool, str]:
             )
             connection.commit()
         return True, f"{cleaned_name} さんを登録しました。"
-    except sqlite3.IntegrityError:
-        return False, "その名前はすでに登録されています。"
+    except Exception as error:
+        if is_unique_constraint_error(error):
+            return False, "その名前はすでに登録されています。"
+        raise
 
 
 def delete_member(name: str) -> tuple[bool, str]:
@@ -499,7 +555,23 @@ def load_shifts() -> pd.DataFrame:
                 ON s.shift_date = r.shift_date
             ORDER BY s.shift_date ASC, s.start_time ASC, s.name ASC
         """
-        return pd.read_sql_query(query, connection)
+        rows = connection.execute(query).fetchall()
+    columns = [
+        "id",
+        "name",
+        "shift_date",
+        "start_time",
+        "end_time",
+        "motivation_level",
+        "note",
+        "created_at",
+        "staff_1700",
+        "staff_1730",
+        "staff_1800",
+        "staff_1830",
+        "staff_1900",
+    ]
+    return pd.DataFrame([dict(row) for row in rows], columns=columns)
 
 
 def build_csv(dataframe: pd.DataFrame) -> bytes:
@@ -540,31 +612,31 @@ def build_schedule_png(dataframe: pd.DataFrame, title: str) -> bytes | None:
     except ImportError:
         return None
 
-    title_font = load_table_font(30)
-    header_font = load_table_font(18)
-    body_font = load_table_font(18)
-    small_font = load_table_font(13)
-    strong_font = load_table_font(20)
+    title_font = load_table_font(24)
+    header_font = load_table_font(15)
+    body_font = load_table_font(15)
+    small_font = load_table_font(11)
+    strong_font = load_table_font(17)
 
     columns = list(dataframe.columns)
     column_widths = []
     for column in columns:
         column_name = str(column)
         if column_name == "名前":
-            column_widths.append(135)
+            column_widths.append(105)
         elif is_schedule_day_column(column_name):
-            column_widths.append(92)
+            column_widths.append(68)
         else:
-            column_widths.append(145)
+            column_widths.append(112)
 
-    header_height = 46
+    header_height = 34
     row_heights = []
     for _, row in dataframe.iterrows():
         max_lines = max(len(str(value).splitlines()) for value in row)
-        row_heights.append(max(48, 28 + (max_lines * 24)))
+        row_heights.append(max(38, 18 + (max_lines * 19)))
 
-    margin = 28
-    title_height = 48
+    margin = 16
+    title_height = 36
     table_width = sum(column_widths)
     table_height = header_height + sum(row_heights)
     image_width = table_width + (margin * 2)
@@ -572,7 +644,7 @@ def build_schedule_png(dataframe: pd.DataFrame, title: str) -> bytes | None:
 
     image = Image.new("RGB", (image_width, image_height), "white")
     draw = ImageDraw.Draw(image)
-    draw.text((margin, margin - 4), title, font=title_font, fill="#0f172a")
+    draw.text((margin, margin - 2), title, font=title_font, fill="#0f172a")
 
     x = margin
     y = margin + title_height
@@ -594,13 +666,13 @@ def build_schedule_png(dataframe: pd.DataFrame, title: str) -> bytes | None:
             if is_shortage_row and is_schedule_day_column(column):
                 shortage_count = int(cell_text) if cell_text.isdigit() else 0
                 if shortage_count > 0:
-                    pill_width = 44
-                    pill_height = 28
+                    pill_width = 34
+                    pill_height = 22
                     pill_left = x + (width - pill_width) / 2
                     pill_top = y + (row_height - pill_height) / 2
                     draw.rounded_rectangle(
                         (pill_left, pill_top, pill_left + pill_width, pill_top + pill_height),
-                        radius=14,
+                        radius=11,
                         fill="#fecaca",
                     )
                     draw_centered_text(
@@ -614,24 +686,24 @@ def build_schedule_png(dataframe: pd.DataFrame, title: str) -> bytes | None:
                     draw_centered_text(draw, (x, y, x + width, y + row_height), "0", body_font, "#9ca3af")
             elif is_schedule_day_column(column) and cell_text:
                 lines = cell_text.splitlines()
-                current_y = y + 8
+                current_y = y + 5
                 for line in lines:
                     if line.startswith("req:"):
                         draw_centered_text(
                             draw,
-                            (x, current_y, x + width, current_y + 18),
+                            (x, current_y, x + width, current_y + 14),
                             line.removeprefix("req:"),
                             small_font,
                             "#64748b",
                         )
-                        current_y += 20
+                        current_y += 15
                     elif line:
-                        pill_width = min(width - 14, 48)
-                        pill_height = 28
+                        pill_width = min(width - 8, 38)
+                        pill_height = 22
                         pill_left = x + (width - pill_width) / 2
                         draw.rounded_rectangle(
                             (pill_left, current_y, pill_left + pill_width, current_y + pill_height),
-                            radius=14,
+                            radius=11,
                             fill="#e0f2fe",
                         )
                         draw_centered_text(
@@ -641,7 +713,7 @@ def build_schedule_png(dataframe: pd.DataFrame, title: str) -> bytes | None:
                             strong_font,
                             "#075985",
                         )
-                        current_y += 30
+                        current_y += 23
             else:
                 draw_centered_text(draw, (x + 4, y, x + width - 4, y + row_height), cell_text, body_font, "#111827")
 
@@ -774,9 +846,8 @@ def build_schedule_for_month(target_month: date, half_label: str) -> tuple[pd.Da
                 previous_day -= timedelta(days=1)
             return streak
 
-        def candidate_sort_key(name: str) -> tuple[int, float, float, int, int, int, int, float]:
+        def candidate_sort_key(name: str) -> tuple[float, float, int, int, int, int, int, float]:
             return (
-                MOTIVATION_PRIORITY.get(motivation_map.get(name, "B"), MOTIVATION_PRIORITY["B"]),
                 motivation_adjusted_assignment_ratio(
                     name,
                     motivation_map.get(name, "B"),
@@ -791,6 +862,7 @@ def build_schedule_for_month(target_month: date, half_label: str) -> tuple[pd.Da
                     busy_request_counts,
                     regular_request_counts,
                 ),
+                MOTIVATION_PRIORITY.get(motivation_map.get(name, "B"), MOTIVATION_PRIORITY["B"]),
                 consecutive_assignment_streak(name),
                 assignment_counts.get(name, 0),
                 request_day_counts.get(name, 0),
@@ -798,15 +870,15 @@ def build_schedule_for_month(target_month: date, half_label: str) -> tuple[pd.Da
                 random_tiebreakers[name],
             )
 
-        def candidate_score(name: str, assigned_start: str) -> tuple[int, float, float, int, int, int, int, int, float]:
+        def candidate_score(name: str, assigned_start: str) -> tuple[float, float, int, int, int, int, int, int, float]:
             sort_key = candidate_sort_key(name)
             start_gap = STAFFING_TIME_SLOTS.index(assigned_start) - STAFFING_TIME_SLOTS.index(request_map[name])
             return (*sort_key[:7], start_gap, sort_key[7])
 
         def add_scores(
-            first: tuple[int, float, float, int, int, int, int, int, float],
-            second: tuple[int, float, float, int, int, int, int, int, float],
-        ) -> tuple[int, float, float, int, int, int, int, int, float]:
+            first: tuple[float, float, int, int, int, int, int, int, float],
+            second: tuple[float, float, int, int, int, int, int, int, float],
+        ) -> tuple[float, float, int, int, int, int, int, int, float]:
             return tuple(left + right for left, right in zip(first, second))  # type: ignore[return-value]
 
         def find_best_assignments(
@@ -823,13 +895,13 @@ def build_schedule_for_month(target_month: date, half_label: str) -> tuple[pd.Da
                 slot_demands,
                 key=lambda slot: sum(1 for name in ordered_candidates if can_cover(name, slot)),
             )
-            zero_score: tuple[int, float, float, int, int, int, int, int, float] = (0, 0, 0, 0, 0, 0, 0, 0, 0)
+            zero_score: tuple[float, float, int, int, int, int, int, int, float] = (0, 0, 0, 0, 0, 0, 0, 0, 0)
             cache = {}
 
             def search(
                 demand_index: int,
                 used_members: tuple[str, ...],
-            ) -> tuple[tuple[int, float, float, int, int, int, int, int, float], tuple[tuple[str, str], ...]] | None:
+            ) -> tuple[tuple[float, float, int, int, int, int, int, int, float], tuple[tuple[str, str], ...]] | None:
                 if demand_index == len(slot_demands):
                     return zero_score, tuple()
 
@@ -1088,12 +1160,12 @@ def render_schedule_table(dataframe: pd.DataFrame, enable_fullscreen: bool = Fal
             border-collapse: collapse;
             width: max-content;
             min-width: 100%;
-            font-size: 0.9rem;
+            font-size: 0.78rem;
         }}
         .schedule-table th,
         .schedule-table td {{
             border: 1px solid #d1d5db;
-            padding: 0.35rem 0.5rem;
+            padding: 0.22rem 0.32rem;
             text-align: center;
             vertical-align: middle;
             white-space: nowrap;
@@ -1116,34 +1188,34 @@ def render_schedule_table(dataframe: pd.DataFrame, enable_fullscreen: bool = Fal
         }}
         .schedule-table .request-time {{
             color: #64748b;
-            font-size: 0.72rem;
+            font-size: 0.62rem;
             line-height: 1.1;
         }}
         .schedule-table .shift-time {{
             display: inline-block;
-            min-width: 2.25rem;
-            margin-top: 0.1rem;
-            padding: 0.08rem 0.35rem;
+            min-width: 1.65rem;
+            margin-top: 0.05rem;
+            padding: 0.04rem 0.24rem;
             border-radius: 999px;
             background: #e0f2fe;
             color: #075985;
-            font-size: 1rem;
+            font-size: 0.82rem;
             font-weight: 700;
-            line-height: 1.35;
+            line-height: 1.2;
         }}
         .schedule-table .shortage-row td {{
             font-weight: 600;
         }}
         .schedule-table .shortage-count {{
             display: inline-block;
-            min-width: 2.25rem;
-            padding: 0.08rem 0.35rem;
+            min-width: 1.65rem;
+            padding: 0.04rem 0.24rem;
             border-radius: 999px;
             background: #fecaca;
             color: #991b1b;
-            font-size: 1rem;
+            font-size: 0.82rem;
             font-weight: 800;
-            line-height: 1.35;
+            line-height: 1.2;
         }}
         .schedule-table .shortage-zero {{
             color: #9ca3af;
@@ -1184,7 +1256,7 @@ def render_schedule_table(dataframe: pd.DataFrame, enable_fullscreen: bool = Fal
             inset: 0;
             z-index: 999999;
             background: #ffffff;
-            padding: 1rem;
+            padding: 0.5rem;
             overflow: auto;
         }}
         .schedule-fullscreen-toolbar {{
@@ -1195,17 +1267,17 @@ def render_schedule_table(dataframe: pd.DataFrame, enable_fullscreen: bool = Fal
             align-items: center;
             justify-content: space-between;
             gap: 1rem;
-            margin: -1rem -1rem 0.75rem;
-            padding: 0.75rem 1rem;
+            margin: -0.5rem -0.5rem 0.4rem;
+            padding: 0.45rem 0.6rem;
             border-bottom: 1px solid #e5e7eb;
             background: #ffffff;
         }}
         .schedule-fullscreen .schedule-table {{
-            font-size: 1rem;
+            font-size: 0.86rem;
         }}
         .schedule-fullscreen .schedule-table th,
         .schedule-fullscreen .schedule-table td {{
-            padding: 0.45rem 0.6rem;
+            padding: 0.26rem 0.36rem;
         }}
         </style>
         {fullscreen_html}
